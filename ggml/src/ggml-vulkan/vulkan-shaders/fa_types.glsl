@@ -3,6 +3,45 @@
 
 #include "ggml_type_ids.glsl"
 
+// Backward-compatibility aliases for shaders written against older FA_TYPE_* names
+#define FA_TYPE_F32                 GGML_TYPE_F32
+#define FA_TYPE_F16                 GGML_TYPE_F16
+#define FA_TYPE_Q4_0                GGML_TYPE_Q4_0
+#define FA_TYPE_Q4_1                GGML_TYPE_Q4_1
+#define FA_TYPE_Q5_0                GGML_TYPE_Q5_0
+#define FA_TYPE_Q5_1                GGML_TYPE_Q5_1
+#define FA_TYPE_Q8_0                GGML_TYPE_Q8_0
+#define FA_TYPE_Q2_K                GGML_TYPE_Q2_K
+#define FA_TYPE_Q3_K                GGML_TYPE_Q3_K
+#define FA_TYPE_Q4_K                GGML_TYPE_Q4_K
+#define FA_TYPE_Q5_K                GGML_TYPE_Q5_K
+#define FA_TYPE_Q6_K                GGML_TYPE_Q6_K
+#define FA_TYPE_IQ2_XXS             GGML_TYPE_IQ2_XXS
+#define FA_TYPE_IQ2_XS              GGML_TYPE_IQ2_XS
+#define FA_TYPE_IQ3_XXS             GGML_TYPE_IQ3_XXS
+#define FA_TYPE_IQ1_S               GGML_TYPE_IQ1_S
+#define FA_TYPE_IQ4_NL              GGML_TYPE_IQ4_NL
+#define FA_TYPE_IQ3_S               GGML_TYPE_IQ3_S
+#define FA_TYPE_IQ2_S               GGML_TYPE_IQ2_S
+#define FA_TYPE_IQ4_XS              GGML_TYPE_IQ4_XS
+#define FA_TYPE_IQ1_M               GGML_TYPE_IQ1_M
+#define FA_TYPE_BF16                GGML_TYPE_BF16
+#define FA_TYPE_TQ1_0               GGML_TYPE_TQ1_0
+#define FA_TYPE_TQ2_0               GGML_TYPE_TQ2_0
+#define FA_TYPE_MXFP4               GGML_TYPE_MXFP4
+#define FA_TYPE_NVFP4               GGML_TYPE_NVFP4
+#define FA_TYPE_Q1_0                GGML_TYPE_Q1_0
+#define FA_TYPE_Q2_0                GGML_TYPE_Q2_0
+#define FA_TYPE_Q4_0_ROCMFP4        GGML_TYPE_Q4_0_ROCMFP4
+#define FA_TYPE_Q4_0_ROCMFP4_FAST   GGML_TYPE_Q4_0_ROCMFP4_FAST
+#define FA_TYPE_Q6_0_ROCMFPX        GGML_TYPE_Q6_0_ROCMFPX
+#define FA_TYPE_Q8_0_ROCMFPX        GGML_TYPE_Q8_0_ROCMFPX
+#define FA_TYPE_Q3_0_ROCMFPX        GGML_TYPE_Q3_0_ROCMFPX
+#define FA_TYPE_TURBO3_0            GGML_TYPE_TURBO3_0
+#define FA_TYPE_TURBO4_0            GGML_TYPE_TURBO4_0
+#define FA_TYPE_Q2_0_ROCMFPX        GGML_TYPE_Q2_0_ROCMFPX
+#define FA_TYPE_Q4_0_ROCMI4         GGML_TYPE_Q4_0_ROCMI4
+
 // Number of matrix elements per buffer block, derived from the K/V type spec
 // constant. F32 is treated as a vec4 "block" of 4 floats. F16 uses block size 1
 // and bypasses the dequant path entirely. Quants follow their ggml block sizes.
