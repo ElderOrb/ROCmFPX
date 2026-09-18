@@ -71,7 +71,20 @@ file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
 ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
-list(APPEND GGML_SOURCES_ROCM ${SRCS})
+list(APPEND GGML_SOURCES_ROCM ${SRCS}
+    ../ggml-cuda/template-instances/fattn-vec-instance-q4_0_rocmfp4-q4_0_rocmfp4.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-q4_0_rocmfp4_fast-q4_0_rocmfp4_fast.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-q3_0_rocmfpx-q3_0_rocmfpx.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-q6_0_rocmfpx-q6_0_rocmfpx.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-q8_0_rocmfpx-q8_0_rocmfpx.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-q8_0.cu)
 
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
