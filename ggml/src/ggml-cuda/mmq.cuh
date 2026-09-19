@@ -1572,7 +1572,11 @@ struct mmq_args {
 };
 
 static bool fork_compact_supported(const mmq_args & a, bool fallback, int cc) {
-    return a.type_x == GGML_TYPE_IQ4_NL && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback &&
+    const bool type_ok = (a.type_x == GGML_TYPE_IQ4_NL ||
+                          a.type_x == GGML_TYPE_Q4_0_ROCMI4 ||
+                          a.type_x == GGML_TYPE_Q4_0_ROCMFP4_FAST ||
+                          a.type_x == GGML_TYPE_Q4_K);
+    return type_ok && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback &&
         a.ids_dst != nullptr && a.expert_bounds != nullptr && a.nchannels_x == 512 && a.nchannels_y == 512 &&
         a.nsamples_x == 1 && a.nsamples_y == 1 && a.ncols_max >= 16 && a.ncols_max <= 32768 &&
         a.ncols_dst == a.ncols_max * 10 &&

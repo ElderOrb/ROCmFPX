@@ -27,10 +27,24 @@ struct llama_lazy_reader {
         GGML_ABORT("lazy direct reads are not supported on this platform");
     }
 #else
+    struct segment {
+        size_t  file_offs;
+        int64_t row_start;
+        int64_t n_rows;
+    };
+
     llama_lazy_reader(int fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
                       enum ggml_type type, int64_t head_dim)
         : fd(fd), base(base), row_size(row_size), n_rows(n_rows), n_threads(n_threads),
           head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
+        GGML_ASSERT((type == GGML_TYPE_F32 || to_float != nullptr) && head_dim > 0);
+    }
+
+    llama_lazy_reader(int fd, std::vector<segment> segs, size_t row_size, int64_t n_rows, int n_threads,
+                      enum ggml_type type, int64_t head_dim)
+        : fd(fd), base(0), row_size(row_size), n_rows(n_rows), n_threads(n_threads),
+          head_dim(head_dim), segments(std::move(segs)),
+          to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
         GGML_ASSERT((type == GGML_TYPE_F32 || to_float != nullptr) && head_dim > 0);
     }
 
@@ -43,13 +57,26 @@ struct llama_lazy_reader {
         }
     }
 
-    const int      fd;
-    const size_t   base;       // file offset of row 0
-    const size_t   row_size;   // bytes per quantized row
-    const int64_t  n_rows;
-    const int      n_threads;  // in-flight read workers
-    const int64_t  head_dim;
-    ggml_to_float_t to_float;  // same dequantizer the ggml_get_rows CPU kernel uses
+    const int            fd;
+    const size_t         base;       // file offset of row 0
+    const size_t         row_size;   // bytes per quantized row
+    const int64_t        n_rows;
+    const int            n_threads;  // in-flight read workers
+    const int64_t        head_dim;
+    std::vector<segment> segments;
+    ggml_to_float_t      to_float;   // same dequantizer the ggml_get_rows CPU kernel uses
+
+    size_t get_row_offset(int64_t r) const {
+        if (segments.empty()) {
+            return base + (size_t) r * row_size;
+        }
+        for (const auto & s : segments) {
+            if (r >= s.row_start && r < s.row_start + s.n_rows) {
+                return s.file_offs + (size_t)(r - s.row_start) * row_size;
+            }
+        }
+        return base + (size_t) r * row_size;
+    }
 
     // fill dst with the n gathered rows, dequantized to F32:
     // dst[slot * head_dim, ...) = to_float(table[rows[slot]])
@@ -116,7 +143,7 @@ struct llama_lazy_reader {
         auto run = [&](int w) {
             const int64_t b = (int64_t) uniq.size() * w / n_workers, e = (int64_t) uniq.size() * (w + 1) / n_workers;
             for (int64_t i = b; i < e; ++i) {
-                const size_t off = base + (size_t) uniq[i] * row_size;
+                const size_t off = get_row_offset(uniq[i]);
                 ::posix_fadvise(fd, (off_t) off, (off_t) row_size, POSIX_FADV_WILLNEED);
             }
         };
@@ -140,7 +167,7 @@ private:
             while (j + 1 < end && pairs[j + 1].first == pairs[i].first) {
                 ++j;
             }
-            const size_t off = base + (size_t) pairs[i].first * row_size;
+            const size_t off = get_row_offset(pairs[i].first);
             for (size_t done = 0; done < row_size; ) {
                 const ssize_t n_read = ::pread(fd, bounce.data() + done, row_size - done, off + done);
                 if (n_read < 0 && errno == EINTR) {

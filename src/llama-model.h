@@ -831,6 +831,13 @@ struct llama_model_base : public llama_model {
     // per lazy tensor after creating it; returns null if the platform cannot
     // serve direct reads (the tensor then stays on the lazy mmap path).
     const llama_lazy_reader * load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t);
+    const llama_lazy_reader * load_lazy_reader_segmented(
+            llama_model_loader & ml,
+            const char * name,
+            int64_t head_dim,
+            int64_t ple_rows,
+            const std::vector<uint64_t> & head_offsets,
+            const std::vector<uint64_t> & head_vocab_sizes);
 
     std::map<std::string, std::unique_ptr<llama_lazy_reader>> lazy_readers;
 };

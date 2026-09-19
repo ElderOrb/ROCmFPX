@@ -222,12 +222,19 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                                 ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
             }
             ple_rows = ple_w->tensor->ne[1];
+
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+
+            ple_reader = load_lazy_reader(ml, ple_name.c_str(), per_layer_tok_embd);
+        } else if (ml.get_weight("ple_ngram_embd.0.weight") != nullptr) {
+            std::vector<uint64_t> offsets(hparams.ple_head_offsets.begin(), hparams.ple_head_offsets.begin() + hparams.ple_n_heads);
+            std::vector<uint64_t> vocabs(hparams.ple_head_vocab_sizes.begin(), hparams.ple_head_vocab_sizes.begin() + hparams.ple_n_heads);
+            ple_reader = load_lazy_reader_segmented(ml, ple_name.c_str(), hparams.ple_head_dim, ple_rows, offsets, vocabs);
+            per_layer_tok_embd = nullptr;
+        } else {
+            throw std::runtime_error(format("qwen4exp: neither '%s' nor 'ple_ngram_embd.0.weight' found", ple_name.c_str()));
         }
-
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
-
-        ple_reader = load_lazy_reader(ml, ple_name.c_str(), per_layer_tok_embd);
     }
 
     const int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
@@ -309,9 +316,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
         layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
 
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags);
-        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
-        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags | TENSOR_NOT_REQUIRED);
 
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
@@ -322,7 +329,7 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
-    if (hc_head_norm == nullptr) {
+    if (hc_head_norm == nullptr || (hparams.n_layer() > 0 && layers[0].hc_attn_norm == nullptr)) {
         throw std::runtime_error("this model is an MTP draft head without a trunk; "
                                  "load it as a draft of its target model (-md), not on its own");
     }
@@ -562,7 +569,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(layer.nextn.eh_proj     && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm       && "MTP block missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm       && "MTP block missing nextn.hnorm");
-    GGML_ASSERT(layer.nextn.hc_head_norm && "MTP block missing nextn.hc_head_norm");
+    ggml_tensor * hc_head_norm = layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm;
+    ggml_tensor * hc_head_down = layer.nextn.hc_head_down ? layer.nextn.hc_head_down : model.hc_head_down;
+    ggml_tensor * hc_head_up   = layer.nextn.hc_head_up   ? layer.nextn.hc_head_up   : model.hc_head_up;
+
+    if (hc_head_norm == nullptr) {
+        const llama_model & other = qwen4exp_shared_model(cparams, model, "output_hc_norm.weight");
+        hc_head_norm = other.hc_head_norm;
+        hc_head_down = other.hc_head_down;
+        hc_head_up   = other.hc_head_up;
+    }
+    GGML_ASSERT(hc_head_norm && "MTP block missing hc_head_norm");
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -749,7 +766,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_h_nextn = res_hc;
 
     cur = build_hc_mix(res_hc,
-            layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up,
+            hc_head_norm, hc_head_down, hc_head_up,
             nullptr, nullptr, -1);
     cb(cur, "mtp_hc_head", -1);
 
@@ -809,7 +826,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
     return blk_bias && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
-        n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
+        n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token && ubatch.n_tokens >= 128 &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256;
 }
@@ -1318,6 +1335,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
                 indices_all->nb[1], indices_all->nb[2], indices_all->nb[3], first*indices_all->nb[1]);
 
         const bool direct_indices =
+            n_tokens >= 128 &&
             n_stream == 1 && cparams.flash_attn && cparams.offload_kqv &&
             hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
         ggml_tensor * kq_mask_top_k = kq_mask;
@@ -1388,7 +1406,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
             ggml_build_forward_expand(gf, cur);
         } else {
-            cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, n_kv_max, kq_scale, il);
+            cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
         }
         qwen4exp_append_strip(ctx0,gf,output,cur);
     }
@@ -1890,6 +1908,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
         emb = ggml_reshape_2d(ctx0, data, hparams.ple_head_dim * n_heads, n_tokens);
     } else {
+        if (!model.per_layer_tok_embd) {
+            throw std::runtime_error("qwen4exp: segmented PLE requires direct lazy reader (--lazy-mode on-direct)");
+        }
         ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
         ggml_set_input(ple_inp->rows);
         ggml_tensor * rows = ple_inp->rows;

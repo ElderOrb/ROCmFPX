@@ -1697,7 +1697,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    ml.done_getting_tensors();
+    ml.done_getting_tensors(true);
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
@@ -1910,11 +1910,75 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
     lazy_readers[tensor_name] = std::move(reader);
     return lazy_readers.at(tensor_name).get();
 }
+
+const llama_lazy_reader * llama_model_base::load_lazy_reader_segmented(
+        llama_model_loader & ml,
+        const char * name,
+        int64_t head_dim,
+        int64_t ple_rows,
+        const std::vector<uint64_t> & head_offsets,
+        const std::vector<uint64_t> & head_vocab_sizes) {
+    if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
+        return nullptr;
+    }
+
+    if (const auto it = lazy_readers.find(name); it != lazy_readers.end()) {
+        return it->second.get();
+    }
+
+    const auto * w0 = ml.get_weight("ple_ngram_embd.0.weight");
+    if (!w0) {
+        return nullptr;
+    }
+
+    const int fd = ::open(ml.files[w0->idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LLAMA_LOG_WARN("%s: could not open %s for direct reads (%s)\n",
+                __func__, ml.files[w0->idx]->name().c_str(), strerror(errno));
+        return nullptr;
+    }
+
+#ifdef __linux__
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+
+    int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
+    enum ggml_type type = w0->tensor->type;
+    size_t row_size = ggml_row_size(type, head_dim);
+
+    std::vector<llama_lazy_reader::segment> segs;
+    for (size_t h = 0; h < head_offsets.size(); ++h) {
+        char hname[64];
+        snprintf(hname, sizeof(hname), "ple_ngram_embd.%zu.weight", h);
+        const auto * wh = ml.get_weight(hname);
+        if (!wh) {
+            LLAMA_LOG_ERROR("%s: missing %s\n", __func__, hname);
+            ::close(fd);
+            return nullptr;
+        }
+        segs.push_back({ wh->offs, (int64_t) head_offsets[h], (int64_t) head_vocab_sizes[h] });
+    }
+
+    auto reader = std::make_unique<llama_lazy_reader>(fd, std::move(segs), row_size, ple_rows, n_threads, type, head_dim);
+    LLAMA_LOG_INFO("%s: segmented direct reads enabled for %s: %zu heads, %" PRId64 " rows of %zu bytes (%s), %d threads\n",
+            __func__, name, head_offsets.size(), ple_rows, row_size, ggml_type_name(type), n_threads);
+
+    ml.n_created += (int) head_offsets.size();
+
+    lazy_readers[name] = std::move(reader);
+    return lazy_readers.at(name).get();
+}
 #else
 const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char *, const ggml_tensor *) {
     if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
         LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
     }
+    return nullptr;
+}
+
+const llama_lazy_reader * llama_model_base::load_lazy_reader_segmented(
+        llama_model_loader & ml, const char *, int64_t, int64_t,
+        const std::vector<uint64_t> &, const std::vector<uint64_t> &) {
     return nullptr;
 }
 #endif
