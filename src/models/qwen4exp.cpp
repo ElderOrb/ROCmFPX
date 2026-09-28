@@ -9,6 +9,27 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <numeric>
+#include <limits>
+#include "../rocmfpx-draft-vocab.h"
+
+// Sparse draft-attention threshold for the MTP/nextn layer, in ubatch tokens.
+// Below the threshold the indexer (score every block, top-k, block select) costs more than dense
+// attention over the whole cache and the layer attends densely instead; the indexer cache is still
+// updated, so later sparse ubatches stay correct. 0 and 1 are equivalent.
+// The default here is 1 because decode-size sparse draft attention is already
+// part of this build's measured baseline; 128 restores dense draft attention at decode sizes.
+static int64_t qwen4exp_mtp_qsa_min_t(void) {
+    static const int64_t value = [] {
+        const char * env = std::getenv("LLAMA_MTP_QSA_MIN_T");
+        return env ? (int64_t) std::atoll(env) : (int64_t) 1;
+    }();
+    return value;
+}
+
 #include <cinttypes>
 #include "block-graph.inc"
 
@@ -99,6 +120,8 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
                     LLAMA_LOG_INFO("%s: nextn layer %u compress ratio 0 -> %d\n", __func__, j, trunk_r);
                 }
             }
+            LLAMA_LOG_INFO("%s: nextn sparse draft attention threshold LLAMA_MTP_QSA_MIN_T = %lld tokens\n",
+                    __func__, (long long) qwen4exp_mtp_qsa_min_t());
         }
     }
 
@@ -601,7 +624,21 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    static const bool pad_head = [] {
+        const char * value = std::getenv("ROCMFPX_QWEN4_PAD_HEAD");
+        return value && value[0] == '1';
+    }();
+    const int64_t head_rows = cur->ne[1];
+    const bool use_padded_head = pad_head && model.output->type == GGML_TYPE_BF16 &&
+        ggml_is_matrix(cur) && head_rows >= 2 && head_rows <= 3;
+    if (use_padded_head) {
+        // Select the matrix kernel without adding transformer verification rows.
+        cur = ggml_pad(ctx0, cur, 0, 4 - head_rows, 0, 0);
+    }
     cur = build_lora_mm(model.output, cur, model.output_s);
+    if (use_padded_head) {
+        cur = ggml_view_2d(ctx0, cur, cur->ne[0], head_rows, cur->nb[1], 0);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -765,12 +802,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width    = (int64_t) hparams.indexer_top_k + r - 1;
         ggml_tensor * top_k = nullptr;
-        bool sparse_decode = false;
+        // The private split-D decode kernel only covers 1..8 queries and the qsa3 path declines below
+        // 128 queries, so 9..127 has no sparse kernel and attends densely.
+        bool sparse_capable = false;
 #if defined(GGML_USE_HIP)
-        sparse_decode = n_tokens <= 8 && mctx_hyb->get_n_stream() == 1 &&
+        sparse_capable = n_tokens <= 8 && mctx_hyb->get_n_stream() == 1 &&
             cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
 #endif
-        if (r > 0 && n_kv_idx > width && (n_tokens >= 128 || sparse_decode)) {
+        const bool sparse = n_tokens >= qwen4exp_mtp_qsa_min_t() && (n_tokens >= 128 || sparse_capable);
+        if (r > 0 && n_kv_idx > width && sparse) {
             top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp_attn->get_kq_mask(), sections, il);
         } else if (r > 0) {
             build_qsa_store_k(mctx_hyb, cur, il);
@@ -836,7 +876,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
     }
 
-    cur = build_lora_mm(head_w, cur, head_s);
+    auto draft_vocabulary = rocmfpx::draft_vocabulary_for(&model);
+    if (draft_vocabulary && ggml_nrows(cur) == 1) {
+        GGML_ASSERT(!head_s && "native draft vocabulary requires an unscaled head");
+        auto projection = rocmfpx::build_draft_projection(ctx0, std::move(draft_vocabulary), head_w, cur);
+        cur = projection.logits;
+        res->add_input(std::move(projection.input));
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -1389,8 +1437,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor * top_k = ggml_view_4d(ctx0, indices_all, indices_all->ne[0], n_query, 1, n_stream,
                 indices_all->nb[1], indices_all->nb[2], indices_all->nb[3], first*indices_all->nb[1]);
 
+        // Private gfx1151 experiment: the existing QSA decode kernel consumes
+        // the selected indices too. Keep the causal mask and fail closed on
+        // unsupported shapes below. Keep the original path for short caches:
+        // the sparse WMMA path changes rounding and only benefits longer scans.
+        // The default path is unchanged.
+        bool decode_direct = false;
+#if defined(GGML_USE_HIP)
+        const char * decode_direct_env = getenv("ROCMFPX_QWEN4_QSA_DECODE");
+        decode_direct = decode_direct_env && strcmp(decode_direct_env, "1") == 0 &&
+            n_tokens >= 1 && n_tokens <= 8 && n_query <= 8 &&
+            kq_mask->ne[0] >= 8192;
+#endif
         const bool direct_indices =
-            n_tokens >= 128 &&
+            (n_tokens >= 128 || decode_direct) &&
             n_stream == 1 && cparams.flash_attn && cparams.offload_kqv &&
             hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
         ggml_tensor * kq_mask_top_k = kq_mask;
@@ -1451,7 +1511,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             ggml_tensor * mask = maskless ? nullptr : (ggml_is_contiguous(kq_mask) ? kq_mask : ggml_cont(ctx0, kq_mask));
             ggml_tensor * indices = ggml_is_contiguous(top_k) ? top_k : ggml_cont(ctx0, top_k);
             GGML_ASSERT(indices->ne[1] == kq_mask->ne[1] && indices->ne[3] == kq_mask->ne[3]);
+            if (decode_direct) {
+                const auto device = model.dev_layer(il);
+                GGML_ASSERT(device && strcmp(ggml_backend_dev_name(device), "ROCm0") == 0 &&
+                    strstr(ggml_backend_dev_description(device), "8060S"));
+                GGML_ASSERT(q_view->type == GGML_TYPE_F32 && q_view->ne[1] >= 1 && q_view->ne[1] <= 8);
+                GGML_ASSERT(q_view->nb[0] == 4 && k_view->nb[0] == 2 && v_view->nb[0] == 2);
+                GGML_ASSERT(k_view->ne[0] == 256 && v_view->ne[0] == 256);
+                GGML_ASSERT(k_view->ne[1] >= 1 && k_view->ne[1] <= 262144 && v_view->ne[1] == k_view->ne[1]);
+                GGML_ASSERT(q_view->ne[3] == 1 && k_view->ne[3] == 1 && v_view->ne[3] == 1);
+                GGML_ASSERT(k_view->ne[2] > 0 && q_view->ne[2] % k_view->ne[2] == 0 && v_view->ne[2] == k_view->ne[2]);
+                GGML_ASSERT(indices->type == GGML_TYPE_I32 && indices->ne[0] >= 1 && indices->ne[0] <= 2560);
+                GGML_ASSERT(indices->ne[2] == 1 && indices->ne[3] == 1 && !packed_keys && !packed_values && mask);
+                GGML_ASSERT(indices->nb[0] == 4 && indices->ne[1] >= q_view->ne[1]);
+                GGML_ASSERT(mask->type == GGML_TYPE_F16 && mask->nb[0] == 2 &&
+                    mask->ne[0] >= k_view->ne[1] && mask->ne[1] >= q_view->ne[1] &&
+                    mask->ne[2] == 1 && mask->ne[3] == 1);
+            }
             cur = ggml_flash_attn_ext(ctx0, q_view, k_view, v_view, mask, kq_scale, 0.0f, 0.0f);
+            if (decode_direct) {
+                GGML_ASSERT(cur->type == GGML_TYPE_F32 && ggml_is_contiguous(cur) && !cur->src[4]);
+            }
             cur->src[5] = indices;
             cur->src[6] = packed_keys;
             cur->src[7] = packed_values;
