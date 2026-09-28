@@ -39,6 +39,7 @@ set(LLAMA_CORE_SOURCES
     llama-quant.cpp
     llama-sampler.cpp
     llama-vocab.cpp
+    rocmfpx-draft-vocab.cpp
     rocmfpx-plugin.cpp
     unicode-data.cpp
     unicode.cpp

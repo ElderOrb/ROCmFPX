@@ -352,7 +352,15 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define VDR_ROCMFP4_Q8_1_MMQ  GGML_ROCMFP4_Q8_1_MMQ_VDR
 #define VDR_ROCMFP4_FAST_Q8_1_MMVQ GGML_ROCMFP4_FAST_Q8_1_MMVQ_VDR
 #define VDR_ROCMFP4_FAST_Q8_1_MMQ  GGML_ROCMFP4_FAST_Q8_1_MMQ_VDR
-#define VDR_ROCMI4_Q8_1_MMVQ VDR_ROCMFP4_FAST_Q8_1_MMVQ
+// Tune ROCmI4 MMVQ independently of the floating-point codebook formats.
+// The default preserves their established launch policy; gfx1151 can test 4.
+#ifndef GGML_ROCMI4_Q8_1_MMVQ_VDR
+#define GGML_ROCMI4_Q8_1_MMVQ_VDR VDR_ROCMFP4_FAST_Q8_1_MMVQ
+#endif
+#if GGML_ROCMI4_Q8_1_MMVQ_VDR != 1 && GGML_ROCMI4_Q8_1_MMVQ_VDR != 2 && GGML_ROCMI4_Q8_1_MMVQ_VDR != 4
+#error "GGML_ROCMI4_Q8_1_MMVQ_VDR must be 1, 2, or 4"
+#endif
+#define VDR_ROCMI4_Q8_1_MMVQ GGML_ROCMI4_Q8_1_MMVQ_VDR
 #define VDR_ROCMI4_Q8_1_MMQ  VDR_ROCMFP4_FAST_Q8_1_MMQ
 #ifndef GGML_ROCMFP3_Q8_1_MMVQ_VDR
 #define GGML_ROCMFP3_Q8_1_MMVQ_VDR 2
@@ -616,9 +624,21 @@ static __device__ __forceinline__ float vec_dot_rocmi4_q8_1(
 #pragma unroll
     for (int l = 0; l < VDR_ROCMI4_Q8_1_MMVQ; ++l) {
         const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1151__)
+        // Exact signed int4 x int8 dot: split each int8 into low unsigned and
+        // high signed nibbles, preserving integer accumulation and FP scaling.
+        const unsigned mask = 0x0f0f0f0fu;
+        const unsigned a = (unsigned) q8[l + 0];
+        const unsigned b = (unsigned) q8[l + 4];
+        const unsigned lo = (a & mask) | ((b & mask) << 4);
+        const unsigned hi = ((a >> 4) & mask) | (b & 0xf0f0f0f0u);
+        const int upper = __builtin_amdgcn_sudot8(true, aux_q4, true, (int) hi, 0, false);
+        sumi = __builtin_amdgcn_sudot8(true, aux_q4, false, (int) lo, sumi + 16 * upper, false);
+#else
         const int2 v = rocmi4_unpack_signed_nibbles(aux_q4);
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+#endif
     }
 
     return __low2float(bq8_1->ds) * rocmfpx_ue4m3_to_fp32_finite(bq4->e) * sumi;

@@ -1131,7 +1131,7 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool sort_experts = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1180,7 +1180,23 @@ static __global__ void mul_mat_vec_q_moe(
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
-    const uint32_t channel_dst = blockIdx.y;
+    uint32_t channel_dst = blockIdx.y;
+#if defined(GGML_USE_HIP)
+    if constexpr (sort_experts) {
+        // Schedule expert reads in ID order across token warps, but retain each
+        // token's original channel for activations and output. Arithmetic and
+        // the downstream expert reduction order remain unchanged.
+        const unsigned lane = threadIdx.x;
+        const int expert = lane < gridDim.y ? ids[lane + token_idx * ids_stride] : 0x7fffffff;
+        unsigned rank = 0;
+        for (unsigned j = 0; j < gridDim.y; ++j) {
+            const int other = __shfl(expert, j, warp_size);
+            rank += other < expert || (other == expert && j < lane);
+        }
+        const unsigned mask = (unsigned) __ballot(lane < gridDim.y && rank == blockIdx.y);
+        channel_dst = __ffs(mask) - 1;
+    }
+#endif
 
     if (token_idx >= ncols_dst) {
         return;
@@ -1401,7 +1417,7 @@ static constexpr int calc_moe_mmvq_rows_per_block() {
     return 2;
 }
 
-template <ggml_type type, int rows_per_block>
+template <ggml_type type, int rows_per_block, bool sort_experts = false>
 static void mul_mat_vec_q_moe_launch_rpb(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
@@ -1419,13 +1435,13 @@ static void mul_mat_vec_q_moe_launch_rpb(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
     if (has_fusion) {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, sort_experts>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, sort_experts>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1468,6 +1484,39 @@ static void mul_mat_vec_q_moe_launch(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+
+#if defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q4_0_ROCMI4) {
+        static const bool sort_experts = [] {
+            const char * value = getenv("ROCMFPX_MOE_SORT_IDS");
+            return value && atoi(value) == 1;
+        }();
+        if (sort_experts && fusion.gate != nullptr && ncols_dst >= 2 && ncols_dst <= 5 &&
+                nchannels_dst <= 32 && nrows_x % 4 == 0 &&
+                GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            mul_mat_vec_q_moe_launch_rpb<type, 4, true>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
+                stride_channel_dst, ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            return;
+        }
+    }
+#endif
+
+    // Keep this decode-only launch experiment separate from the prefill MMQ path.
+    if constexpr (type == GGML_TYPE_Q4_0_ROCMI4) {
+        static const bool wide_rows = [] {
+            const char * value = getenv("ROCMFPX_ROCMI4_MOE_RPB8");
+            return value && atoi(value) == 1;
+        }();
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (wide_rows && !has_fusion && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
+                ncols_dst >= 3 && nrows_x >= 2048 && nrows_x % 8 == 0) {
+            mul_mat_vec_q_moe_launch_rpb<type, 8>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
+                stride_channel_dst, ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            return;
+        }
+    }
 
     if constexpr (type == GGML_TYPE_IQ4_NL) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;

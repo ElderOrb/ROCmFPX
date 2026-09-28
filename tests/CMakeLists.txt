@@ -116,6 +116,12 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+llama_build_and_test(test-rocmfpx-draft-select.cpp)
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    llama_build_and_test(test-rocmfpx-draft-vocab.cpp)
+    target_include_directories(test-rocmfpx-draft-vocab PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 

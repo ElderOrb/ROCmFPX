@@ -1,3 +1,4 @@
+#include "../src/rocmfpx-draft-vocab.h"
 #include "speculative.h"
 
 #include "common.h"
@@ -1338,6 +1339,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_sampler *> backend_chains;
 
     int32_t n_embd = 0;
+    int draft_score_row = -1;
+    std::shared_ptr<rocmfpx::draft_vocabulary> candidate_vocabulary;
+    std::shared_ptr<void> candidate_driver;
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1371,6 +1375,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
+        candidate_vocabulary = rocmfpx::draft_vocabulary_for(llama_get_model(ctx_dft));
+        if (candidate_vocabulary) {
+            GGML_ASSERT(n_seq == 1 && "native draft vocabulary currently supports one slot");
+            candidate_driver = candidate_vocabulary->claim_driver();
+            SPC_INF("ROCmFPX native draft vocabulary: %d rows; target verification uses the full vocabulary\n", candidate_vocabulary->size());
+        }
         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
@@ -1466,6 +1476,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        draft_score_row = -1;
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1598,6 +1609,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
+        draft_score_row = -1;
         return true;
     }
 
@@ -1619,6 +1631,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            if (candidate_vocabulary) {
+                const auto * target_model = llama_get_model(params.ctx_tgt);
+                candidate_vocabulary->update(llama_get_logits_ith(params.ctx_tgt, draft_score_row),
+                    llama_vocab_n_tokens(llama_model_get_vocab(target_model)), dp.id_last);
+            }
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
@@ -1634,6 +1651,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         int i = 0;
+        std::vector<float> cum_hold(n_seq, 0.0f);
 
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
@@ -1670,8 +1688,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                // With no probability cutoff, the MTP draft always takes the
+                // highest logit. Only bypass top-k for a finite unique maximum;
+                // ties and non-finite values retain the original sampler path.
+                const char * cumulative_cut = std::getenv("ROCMFPX_MTP_CUM_P");
+                const bool direct_choice = candidate_vocabulary && n_seq == 1 && !chain_heads &&
+                    params.p_min == 0.0f && !params.backend_sampling &&
+                    (!cumulative_cut || std::strtof(cumulative_cut, nullptr) <= 0.0f);
+                llama_token id = LLAMA_TOKEN_NULL;
+                float p_top = 0.0f;
+                const bool used_exact = direct_choice && candidate_vocabulary->unique_max(
+                    llama_get_logits_ith(ctx_dft, i_last[seq_id]), id);
+                if (!used_exact) {
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1682,24 +1711,41 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                id = cur_p->data[0].id;
+                p_top = cur_p->data[0].p;
+                }
+                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                // ROCMFPX_MTP_CUM_P: stop before a low-confidence token, keep going
+                // up to 5 while the running top-1 stays high. 0 uses p_min and n_max.
+                static const float rocmfpx_cum_p = [] {
+                    const char * env = std::getenv("ROCMFPX_MTP_CUM_P");
+                    return (env && env[0]) ? std::strtof(env, nullptr) : 0.0f;
+                }();
+                if (rocmfpx_cum_p > 0.0f) {
+                    float & cum = cum_hold[seq_id];
+                    if (cum <= 0.0f) {
+                        cum = 1.0f;
+                    }
+                    cum *= p_top;
+                    if (cum < rocmfpx_cum_p || result.size() >= 5) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+                } else if (p_top < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
-
                     continue;
                 }
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
-
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (rocmfpx_cum_p <= 0.0f && params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1763,6 +1809,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        draft_score_row = i_batch_beg[seq_id] + i_h;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
@@ -1772,6 +1819,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        draft_score_row = -1;
         std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
         verify_h[seq_id].clear();
         verify_h_rows[seq_id] = 0;
@@ -1882,11 +1930,37 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     }
 };
 
+// Adapt only the verification window, retaining the configured lookup minimum.
+static size_t ngram_next_window(size_t window, size_t drafted, size_t accepted, size_t maximum) {
+    if (drafted == 0) {
+        return window;
+    }
+    if (accepted == drafted && drafted >= window) {
+        return std::min(maximum, window * 2);
+    }
+    if (accepted * 2 < drafted) {
+        static const bool floor4 = [] {
+            const char * value = std::getenv("ROCMFPX_NGRAM_FLOOR4");
+            return value && std::atoi(value) == 1;
+        }();
+        size_t next = floor4 ? 4 : 8;
+        while (next < accepted + 1) {
+            next *= 2;
+        }
+        return std::min(maximum, next);
+    }
+    return window;
+}
+
 struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     common_params_speculative_ngram_mod params;
 
     // shared across all sequences
     common_ngram_mod mod;
+    // 6-token fallback, probed only when the 24-token table misses at the first position.
+    common_ngram_mod mod6;
+    const bool ngram6;
+    const bool adaptive_window = std::getenv("ROCMFPX_NGRAM_WINDOW") != nullptr;
 
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
@@ -1894,9 +1968,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     struct seq_info {
         // the last position in the prompt that was added to the ngram container
         size_t i_last = 0;
+        size_t i_last6 = 0;
 
         // length of the last drafted n-gram (number of tokens returned by draft)
         size_t n_draft_last = 0;
+        size_t window = 0;
 
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
@@ -1910,6 +1986,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq, params.ngram_mod.n_max)
         , params(params.ngram_mod)
         , mod(params.ngram_mod.n_match, 4*1024*1024)
+        , mod6(6, 1024*1024)
+        , ngram6([] {
+            const char * env = std::getenv("ROCMFPX_NGRAM6");
+            return env && env[0] == '1';
+        }())
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
 
@@ -1931,7 +2012,15 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         auto & sinfo = sinfos[seq_id];
 
         sinfo.i_last = 0;
+        sinfo.i_last6 = 0;
         sinfo.n_draft_last = 0;
+
+        if (ngram6 && prompt.size() > 6) {
+            for (size_t i = 0; i < prompt.size() - 6; ++i) {
+                mod6.add(prompt.data() + i);
+            }
+            sinfo.i_last6 = prompt.size() - 6;
+        }
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -1952,6 +2041,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
 
             mod.reset();
+            if (ngram6) {
+                mod6.reset();
+            }
         }
     }
 
@@ -1981,6 +2073,13 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             sinfo.i_last = cur_len - n;
         }
 
+        if (ngram6 && sinfo.i_last6 + 32 < cur_len && cur_len > 6) {
+            for (size_t i = sinfo.i_last6; i < cur_len - 6; ++i) {
+                mod6.add(prompt.data() + i);
+            }
+            sinfo.i_last6 = cur_len - 6;
+        }
+
         result.resize(n + params.n_max);
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt.at(cur_len - n + 1 + i);
@@ -1990,6 +2089,15 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         for (int i = 0; i < params.n_max; ++i) {
             const llama_token token = mod.get(result.data() + i);
             if (token == common_ngram_mod::EMPTY) {
+                if (i == 0 && ngram6 && n >= 6) {
+                    const llama_token tok6 = mod6.get(result.data() + (n - 6));
+                    if (tok6 != common_ngram_mod::EMPTY) {
+                        result.resize(1);
+                        result[0] = tok6;
+                        sinfo.n_draft_last = 1;
+                        return;
+                    }
+                }
                 if (i < params.n_min) {
                     result.clear();
                     return;
@@ -2006,6 +2114,14 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             result[i] = result[n + i];
         }
         result.resize(result.size() - n);
+
+        // Keep lookup eligibility unchanged: only shorten an already valid run.
+        if (adaptive_window) {
+            if (sinfo.window == 0) {
+                sinfo.window = params.n_max;
+            }
+            result.resize(std::min(result.size(), sinfo.window));
+        }
 
         // store length of drafted n-gram for later acceptance analysis
         sinfo.n_draft_last = result.size();
@@ -2036,6 +2152,15 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         auto & sinfo = sinfos[seq_id];
 
+        if (std::getenv("ROCMFPX_TRACE_NGRAM")) {
+            LOG_INF("ngram_accept seq=%d drafted=%zu accepted=%u low=%d\n",
+                    seq_id, sinfo.n_draft_last, n_accepted, sinfo.n_low);
+        }
+
+        if (adaptive_window) {
+            sinfo.window = ngram_next_window(sinfo.window, sinfo.n_draft_last, n_accepted, params.n_max);
+        }
+
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
@@ -2047,8 +2172,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                     }
 
                     mod.reset();
+                    if (ngram6) {
+                        mod6.reset();
+                    }
                     sinfo.n_low = 0;
                     sinfo.i_last = 0;
+                    sinfo.i_last6 = 0;
                 }
             } else {
                 sinfo.n_low = 0;
